@@ -392,34 +392,43 @@ class Preprocessor:
     def _compute_reward(self, hero, env_info, min_monster_dist, is_high_pressure, is_stuck, treasures, buffs, h_pos, last_action, flash_available):
         if self.is_first_step: return [0.0]
         
-        # 1. 主心骨: 分数增量 (步数分+宝箱分)
+        # 1. 主心骨: 环境分数增量 (步数分+宝箱分)
+        # 步数分通常 +0.015/步, 宝箱分 +1.0/个
         cur_score = hero.get("step_score", self.step_no*1.5) + hero.get("treasure_score", 0)
         score_delta = cur_score - self.last_total_score
-        reward = score_delta / 100.0  # 宝箱通常+1.0，苟活通常+0.015
+        reward = score_delta / 100.0
         
-        # 2. 局部启发 (Shaping): 鼓励向目标移动 (仅在低压下生效，防止顶着怪物贪财)
+        # 2. 【核心优化】Buff 拾取事件奖励 (对标宝箱，强化生存资源控制)
+        cur_buff_count = env_info.get("collected_buff", 0)
+        if cur_buff_count > self.last_collected_buff_count:
+            reward += 0.8  # 拾取 Buff 给予大额奖励，鼓励其作为战略资源
+            
+        # 3. 【核心优化】Buff 距离引导 (解耦高压判断)
+        nearest_b = min([_compute_dist(h_pos, b["pos"]) for b in buffs]) if buffs else None
+        if nearest_b is not None and self.last_nearest_buff_dist is not None:
+            delta_b = self.last_nearest_buff_dist - nearest_b
+            # 在高压下(被追击)，Buff 是救命稻草，给予极高权重 (0.05)
+            # 在低压下(发育期)，Buff 是效率工具，给予标准权重 (0.02)
+            buff_shaping_weight = 0.05 if is_high_pressure else 0.02
+            reward += buff_shaping_weight * np.clip(delta_b, -2.0, 2.0)
+
+        # 4. 宝箱距离引导 (仅在低压下生效，防止高压下贪财送命)
         if not is_high_pressure:
             nearest_t = min([_compute_dist(h_pos, t["pos"]) for t in treasures]) if treasures else None
             if nearest_t is not None and self.last_nearest_treasure_dist is not None:
-                delta = self.last_nearest_treasure_dist - nearest_t
-                reward += 0.02 * np.clip(delta, -2.0, 2.0)
+                delta_t = self.last_nearest_treasure_dist - nearest_t
+                reward += 0.02 * np.clip(delta_t, -2.0, 2.0)
                 
-            nearest_b = min([_compute_dist(h_pos, b["pos"]) for b in buffs]) if buffs else None
-            if nearest_b is not None and self.last_nearest_buff_dist is not None:
-                delta_b = self.last_nearest_buff_dist - nearest_b
-                reward += 0.01 * np.clip(delta_b, -2.0, 2.0)
-                
-        # 3. 逃生启发 (Shaping): 在高压下鼓励拉远距离
+        # 5. 逃生启发 (Shaping): 在高压下鼓励拉远与怪物的绝对距离
         if is_high_pressure:
             dist_diff = min_monster_dist - self.last_min_monster_raw_dist
             reward += 0.05 * np.clip(dist_diff, -2.0, 2.0)
             
-        # 4. 惩罚: 卡墙或原地不动
+        # 6. 惩罚项: 卡墙、原地不动、滥用闪现
         flash_used = 8 <= last_action <= 15
         if is_stuck and not flash_used:
             reward -= 0.1
             
-        # 5. 滥用闪现惩罚
         if flash_used and not is_high_pressure:
             reward -= 0.2
 
@@ -434,6 +443,7 @@ class Preprocessor:
         
         self.last_nearest_treasure_dist = min([_compute_dist(h_pos, t["pos"]) for t in treasures]) if treasures else None
         self.last_nearest_buff_dist = min([_compute_dist(h_pos, b["pos"]) for b in buffs]) if buffs else None
+        self.last_collected_buff_count = env_info.get("collected_buff", 0)
 
         self.position_history.append((h_pos["x"], h_pos["z"]))
         self.last_move_passability = move_passability

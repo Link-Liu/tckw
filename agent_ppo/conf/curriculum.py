@@ -145,10 +145,10 @@ def get_val_config(base_conf):
     env_conf["buff_count"] = 2
     
     # 修改验证集配置，严格对齐官方默认难度
-    env_conf["monster_interval"] = 300      # 官方：300步出第一怪
-    env_conf["monster_speedup"] = 500       # 官方：500步第一怪加速
-    env_conf["max_step"] = 1000             # 官方默认结束步数
-    env_conf["buff_cooldown"] = 200         # 官方默认 buff CD
-    env_conf["talent_cooldown"] = 100       # 官方闪现 CD
+    env_conf["monster_interval"] = 500
+    env_conf["monster_speedup"] = 700
+    env_conf["max_step"] = 1000
+    env_conf["buff_cooldown"] = 100
+    env_conf["talent_cooldown"] = 100
 
     return conf
