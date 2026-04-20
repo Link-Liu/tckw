@@ -9,8 +9,8 @@ Author: Tencent AI Arena Authors
 Enhanced feature preprocessor and reward design for Gorge Chase PPO.
 峡谷追猎 PPO 增强版特征预处理与奖励设计。
 
-特征结构 (76D scalar + 2646D map = 2722D total):
-  - Scalar 特征维持 76D 不变，包含英雄、怪物、距离、雷达射线等。
+特征结构 (80D scalar + 2646D map = 2726D total):
+  - Scalar 特征 80D，包含英雄、怪物、距离、雷达射线、安全退路等。
   - Map 升级为 6通道多维局部地图 (6 x 21 x 21 = 2646D)：
     [0]: 障碍物/道路
     [1]: 宝箱位置
@@ -90,6 +90,7 @@ class Preprocessor:
         
         # 全局记忆矩阵：用于建立探索热图 (128x128)
         self.visited_time = np.full((128, 128), -1, dtype=np.int32)
+        self.last_collected_buff_count = 0
 
     def _get_legal_act(self, observation, hero):
         legal = observation.get("legal_act", None) or observation.get("legal_action", None)
@@ -119,7 +120,14 @@ class Preprocessor:
 
         # 记录全图访问记忆 (更新中心点)
         hz, hx = int(h_pos["z"]), int(h_pos["x"])
+        visit_reward = 0.0
         if 0 <= hz < 128 and 0 <= hx < 128:
+            last_visit = self.visited_time[hz][hx]
+            if not self.is_first_step:
+                if last_visit == -1:
+                    visit_reward = 0.01
+                elif self.step_no - last_visit > 100:
+                    visit_reward = 0.005
             self.visited_time[hz][hx] = self.step_no
 
         flash_available = any(legal_act_raw[i] for i in range(8, 16))
@@ -143,9 +151,20 @@ class Preprocessor:
         monsters_sped_up = any(m.get("speed", 1) > 1 for m in monsters) if monsters else False
         second_monster_active = len(monsters) >= 2
         is_high_pressure = min_monster_dist < 15.0 or monsters_sped_up
+        # 【核心修复】is_danger 仅基于距离，不受 monsters_sped_up 污染
+        # 解决怪物加速后模型完全停止收集宝箱的致命问题
+        is_danger = min_monster_dist < 10.0
 
         treasures = [o for o in organs if o.get("sub_type", 0) == 1 and o.get("status", 0) == 1]
         buffs = [o for o in organs if o.get("sub_type", 0) == 2 and o.get("status", 0) == 1]
+
+        # 计算最近宝箱的安全系数（宝箱方向与怪物方向夹角，值越大越安全）
+        nearest_treasure_safety = 1.0
+        if treasures and nearest_monster_pos:
+            t_nearest = min(treasures, key=lambda t: _compute_dist(h_pos, t["pos"]))
+            t_ang = np.arctan2(t_nearest["pos"]["z"] - h_pos["z"], t_nearest["pos"]["x"] - h_pos["x"])
+            m_ang = np.arctan2(nearest_monster_pos["z"] - h_pos["z"], nearest_monster_pos["x"] - h_pos["x"])
+            nearest_treasure_safety = _angular_distance(t_ang, m_ang) / np.pi
 
         ray_feats = self._compute_rays(map_info)
         openness = sum(ray_feats) / 8.0
@@ -177,8 +196,9 @@ class Preprocessor:
         total_feature = np.concatenate([scalar_feature, map_img])
 
         total_reward = self._compute_reward(
-            hero, env_info, min_monster_dist, is_high_pressure, is_stuck,
-            treasures, buffs, h_pos, last_action, flash_available
+            hero, env_info, min_monster_dist, is_danger, is_stuck,
+            treasures, buffs, h_pos, last_action, flash_available,
+            is_looping, visit_reward, nearest_treasure_safety
         )
 
         self._update_state(
@@ -283,6 +303,19 @@ class Preprocessor:
             c = len(map_info)//2
             inner_pass = sum(1 for dr,dc in [(0,1),(-1,0),(0,-1),(1,0)] if map_info[c+dr][c+dc]!=0)/4.0
         feats.append(inner_pass)
+
+        # 安全逃生路线数：既开阔（射线>0.3）又远离怪物方向（夹角>60°）的退路
+        safe_escape_count = 0
+        if nearest_monster_pos:
+            monster_ang = np.arctan2(nearest_monster_pos["z"] - h_pos["z"], nearest_monster_pos["x"] - h_pos["x"])
+            for idx in range(8):
+                if ray_feats[idx] > 0.3 and _angular_distance(RAY_ANGLES[idx], monster_ang) > np.pi / 3:
+                    safe_escape_count += 1
+        else:
+            safe_escape_count = sum(1 for r in ray_feats if r > 0.3)
+        feats.append(safe_escape_count / 8.0)
+        feats.append(float(safe_escape_count == 0))  # is_trapped: 完全没有安全退路
+
         return feats
 
     def _build_status_features(self, legal_act, last_action, monsters_sped_up, second_monster_active, is_high_pressure):
@@ -389,48 +422,57 @@ class Preprocessor:
     # ================================================================
     # Reward Backbone Redesign
     # ================================================================
-    def _compute_reward(self, hero, env_info, min_monster_dist, is_high_pressure, is_stuck, treasures, buffs, h_pos, last_action, flash_available):
+    def _compute_reward(self, hero, env_info, min_monster_dist, is_danger, is_stuck, treasures, buffs, h_pos, last_action, flash_available, is_looping, visit_reward, nearest_treasure_safety):
         if self.is_first_step: return [0.0]
         
         # 1. 主心骨: 环境分数增量 (步数分+宝箱分)
-        # 步数分通常 +0.015/步, 宝箱分 +1.0/个
         cur_score = hero.get("step_score", self.step_no*1.5) + hero.get("treasure_score", 0)
         score_delta = cur_score - self.last_total_score
         reward = score_delta / 100.0
+
+        # 2. 探索新区域奖励
+        # 【核心修复】用 is_danger 替代 is_high_pressure，怪物加速后仍能探索
+        if not is_danger:
+            reward += visit_reward
         
-        # 2. 【核心优化】Buff 拾取事件奖励 (对标宝箱，强化生存资源控制)
+        # 3. Buff 拾取事件奖励
         cur_buff_count = env_info.get("collected_buff", 0)
         if cur_buff_count > self.last_collected_buff_count:
-            reward += 0.8  # 拾取 Buff 给予大额奖励，鼓励其作为战略资源
+            reward += 0.3  # 从 0.8 降为 0.3，避免 Buff 价值与宝箱混淆
             
-        # 3. 【核心优化】Buff 距离引导 (解耦高压判断)
+        # 4. Buff 距离引导
         nearest_b = min([_compute_dist(h_pos, b["pos"]) for b in buffs]) if buffs else None
         if nearest_b is not None and self.last_nearest_buff_dist is not None:
             delta_b = self.last_nearest_buff_dist - nearest_b
-            # 在高压下(被追击)，Buff 是救命稻草，给予极高权重 (0.05)
-            # 在低压下(发育期)，Buff 是效率工具，给予标准权重 (0.02)
-            buff_shaping_weight = 0.05 if is_high_pressure else 0.02
+            buff_shaping_weight = 0.04 if is_danger else 0.02
             reward += buff_shaping_weight * np.clip(delta_b, -2.0, 2.0)
 
-        # 4. 宝箱距离引导 (仅在低压下生效，防止高压下贪财送命)
-        if not is_high_pressure:
+        # 5. 宝箱距离引导
+        # 【核心修复】用 is_danger 替代 is_high_pressure
+        # 解决怪物加速后（step 500+）模型完全停止捡宝箱的致命问题
+        # 同时乘以 treasure_safety 系数：安全方向的宝箱给满奖励，危险方向降权
+        if not is_danger:
             nearest_t = min([_compute_dist(h_pos, t["pos"]) for t in treasures]) if treasures else None
             if nearest_t is not None and self.last_nearest_treasure_dist is not None:
                 delta_t = self.last_nearest_treasure_dist - nearest_t
-                reward += 0.02 * np.clip(delta_t, -2.0, 2.0)
+                safety_scale = max(0.2, nearest_treasure_safety)
+                reward += 0.02 * safety_scale * np.clip(delta_t, -2.0, 2.0)
                 
-        # 5. 逃生启发 (Shaping): 在高压下鼓励拉远与怪物的绝对距离
-        if is_high_pressure:
+        # 6. 逃生启发 (Shaping): 紧迫危险时鼓励拉远与怪物距离
+        if is_danger:
             dist_diff = min_monster_dist - self.last_min_monster_raw_dist
             reward += 0.05 * np.clip(dist_diff, -2.0, 2.0)
             
-        # 6. 惩罚项: 卡墙、原地不动、滥用闪现
+        # 7. 惩罚项（幅度重新校准，避免淹没生存信号 +0.015/步）
         flash_used = 8 <= last_action <= 15
         if is_stuck and not flash_used:
-            reward -= 0.1
+            reward -= 0.03  # 从 -0.1 降为 -0.03
             
-        if flash_used and not is_high_pressure:
-            reward -= 0.2
+        if flash_used and not is_danger:
+            reward -= 0.1   # 从 -0.2 降为 -0.1
+
+        if is_looping and not is_danger:
+            reward -= 0.05  # 从 -0.15 降为 -0.05
 
         return [float(reward)]
 

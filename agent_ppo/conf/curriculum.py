@@ -104,7 +104,7 @@ def get_curriculum_config(episode_cnt, base_conf):
     env_conf["buff_count"] = random.randint(*stage["buff_count"])
     env_conf["monster_interval"] = random.randint(*stage["monster_interval"])
     env_conf["monster_speedup"] = random.randint(*stage["monster_speedup"])
-    
+
     # 引入 max_step 混训：50% 1000步(官方目标)，30% 1200步，20% 2000步(保鲁棒性)
     rand_step = random.random()
     if rand_step < 0.5:
